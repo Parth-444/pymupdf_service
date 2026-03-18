@@ -1,15 +1,13 @@
 import pymupdf
-import json
 import tempfile
 import os
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="PDF Span Extractor", version="1.0.0")
+app = FastAPI(title="PDF Span Extractor", version="1.1.0")
 
 
 def flags_to_properties(flags: int) -> dict:
-    """Decompose PyMuPDF font flags into readable properties."""
     return {
         "superscript": bool(flags & 2**0),
         "italic": bool(flags & 2**1),
@@ -20,26 +18,13 @@ def flags_to_properties(flags: int) -> dict:
 
 
 def color_to_hex(color_int: int) -> str:
-    """Convert PyMuPDF sRGB integer to hex string."""
     r, g, b = pymupdf.sRGB_to_rgb(color_int)
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-@app.post("/extract-spans")
-async def extract_spans(file: UploadFile = File(...)):
-    """
-    Upload a PDF file and get back all text spans with font metadata.
-
-    Returns JSON with per-page span data including:
-    - text content
-    - font name, size, color (hex)
-    - bold/italic flags
-    - position (x, y) and dimensions (width, height)
-    """
-    # Save uploaded file to temp location
-    tmp_path = os.path.join(tempfile.gettempdir(), f"upload_{file.filename}")
+def process_pdf(contents: bytes, filename: str) -> dict:
+    tmp_path = os.path.join(tempfile.gettempdir(), f"upload_{filename}")
     try:
-        contents = await file.read()
         with open(tmp_path, "wb") as f:
             f.write(contents)
 
@@ -92,15 +77,38 @@ async def extract_spans(file: UploadFile = File(...)):
 
         doc.close()
 
-        return JSONResponse(content={
-            "filename": file.filename,
+        return {
+            "filename": filename,
             "total_pages": len(all_pages),
             "pages": all_pages,
-        })
+        }
 
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+@app.post("/extract-spans")
+async def extract_spans(file: UploadFile = File(...)):
+    """Upload PDF as multipart form-data. Key = 'file'."""
+    contents = await file.read()
+    result = process_pdf(contents, file.filename)
+    return JSONResponse(content=result)
+
+
+@app.post("/extract-spans-binary")
+async def extract_spans_binary(request: Request):
+    """
+    Upload PDF as raw binary body.
+    In n8n HTTP Request node:
+    - Method: POST
+    - URL: .../extract-spans-binary
+    - Body Content Type: Binary File
+    - Content Type: application/pdf
+    """
+    contents = await request.body()
+    result = process_pdf(contents, "upload.pdf")
+    return JSONResponse(content=result)
 
 
 @app.get("/health")
