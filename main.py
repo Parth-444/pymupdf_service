@@ -291,14 +291,20 @@ def extract_drawings(page) -> list:
     drawings = []
     for path in page.get_drawings():
         rect = path["rect"]
+        if rect.is_empty or rect.is_infinite:
+            continue
         item_types = [item[0] for item in path["items"]]
 
+        width_val = path.get("width")
+        stroke_opacity = path.get("stroke_opacity")
+        fill_opacity = path.get("fill_opacity")
+
         drawings.append({
-            "width_pt": round(path["width"], 4),
+            "width_pt": round(width_val, 4) if width_val is not None else 0.0,
             "stroke_color": rgb_tuple_to_hex(path.get("color")),
             "fill_color": rgb_tuple_to_hex(path.get("fill")),
-            "stroke_opacity": path.get("stroke_opacity", 1.0),
-            "fill_opacity": path.get("fill_opacity", 1.0),
+            "stroke_opacity": stroke_opacity if stroke_opacity is not None else 1.0,
+            "fill_opacity": fill_opacity if fill_opacity is not None else 1.0,
             "type": path.get("type", ""),       # 's', 'f', 'fs'
             "is_closed": path.get("closePath", False),
             "dashes": path.get("dashes", "[] 0"),
