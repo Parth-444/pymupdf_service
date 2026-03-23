@@ -384,11 +384,11 @@ def extract_images(page, doc) -> list:
 # SOP says rotation should be 0.0 unless specified.
 # ─────────────────────────────────────────────────────────────
 
-def extract_rotations(rawdict_blocks: list) -> list:
+def extract_rotations(dict_blocks: list) -> list:
     """Find all text spans with non-zero rotation.
     
-    NOTE: rawdict spans have 'chars' list instead of 'text' string.
-    We reconstruct text from chars.
+    NOTE: In PyMuPDF, 'dir' (writing direction vector) is on the LINE level,
+    not on individual spans. We read dir from lines and associate it with spans.
     
     Returns a list of dicts with:
       - text: first 50 chars of the span
@@ -399,27 +399,27 @@ def extract_rotations(rawdict_blocks: list) -> list:
       - size: font size
     """
     rotated_spans = []
-    for block in rawdict_blocks:
+    for block in dict_blocks:
         if "lines" not in block:
             continue
         for line in block["lines"]:
+            direction = line.get("dir", (1, 0))
+            angle = compute_rotation_angle(direction)
+            if abs(angle) <= ROTATION_TOLERANCE:
+                continue
+            # This entire line is rotated — report each span
             for span in line["spans"]:
-                # rawdict: reconstruct text from 'chars' list
-                chars = span.get("chars", [])
-                text = "".join(c.get("c", "") for c in chars).strip()
+                text = span.get("text", "").strip()
                 if not text:
                     continue
-                direction = span.get("dir", (1, 0))
-                angle = compute_rotation_angle(direction)
-                if abs(angle) > ROTATION_TOLERANCE:
-                    rotated_spans.append({
-                        "text": text[:50],
-                        "angle_deg": angle,
-                        "direction": [round(direction[0], 6), round(direction[1], 6)],
-                        "origin": [round(span["origin"][0], 2), round(span["origin"][1], 2)],
-                        "font": span["font"],
-                        "size": round(span["size"], 2),
-                    })
+                rotated_spans.append({
+                    "text": text[:50],
+                    "angle_deg": angle,
+                    "direction": [round(direction[0], 6), round(direction[1], 6)],
+                    "origin": [round(span["origin"][0], 2), round(span["origin"][1], 2)],
+                    "font": span["font"],
+                    "size": round(span["size"], 2),
+                })
 
     return rotated_spans
 
@@ -781,7 +781,15 @@ def classify_page(spans: list) -> dict:
             "annotation_spans": [],
             "header_spans": [],
             "body_spans": [],
-            "page_summary": {"component_type": "unknown", "x_value": None},
+            "page_summary": {
+                "component_type": "unknown",
+                "x_value": None,
+                "x_half_value": None,
+                "header_boundary_y": 0,
+                "total_artwork_spans": 0,
+                "total_annotation_spans": 0,
+                "category_breakdown": {},
+            },
         }
 
     # ── Step 0: Filter ──
@@ -861,24 +869,24 @@ def process_pdf(contents: bytes, filename: str) -> dict:
             page_height = page.rect.height
 
             # ── Extract text with "dict" for reliable span text ──
+            # NOTE: 'dir' (writing direction) lives on the LINE level in both dict and rawdict.
+            # We use dict for everything and extract dir from lines directly.
             dict_data = page.get_text("dict", sort=True, flags=pymupdf.TEXTFLAGS_TEXT)
             dict_blocks = dict_data["blocks"]
 
-            # ── Extract "rawdict" separately for direction vectors (rotation) ──
-            rawdict_data = page.get_text("rawdict", sort=True, flags=pymupdf.TEXTFLAGS_TEXT)
-            rawdict_blocks = rawdict_data["blocks"]
-
-            # ── Build a lookup: (font, size, origin) → direction vector ──
-            # rawdict spans have 'chars' instead of 'text', but do have 'dir'
+            # ── Build a lookup: line origin → direction vector ──
+            # In PyMuPDF, 'dir' (writing direction) is on the LINE, not the span.
+            # We key by the line's bbox y-center + first span origin for matching.
             direction_lookup = {}
-            for block in rawdict_blocks:
+            for block in dict_blocks:
                 if "lines" not in block:
                     continue
                 for line in block["lines"]:
+                    line_dir = line.get("dir", (1, 0))
                     for span in line["spans"]:
                         origin = span.get("origin", (0, 0))
                         key = (round(origin[0], 1), round(origin[1], 1))
-                        direction_lookup[key] = span.get("dir", (1, 0))
+                        direction_lookup[key] = line_dir
 
             # ── Extract raw spans from dict blocks (has 'text' field) ──
             spans_list = []
@@ -922,7 +930,7 @@ def process_pdf(contents: bytes, filename: str) -> dict:
             # ── Extract structural elements ──
             drawings = extract_drawings(page)
             images = extract_images(page, doc)
-            rotated_spans = extract_rotations(rawdict_blocks)
+            rotated_spans = extract_rotations(dict_blocks)
 
             header_boundary = result["page_summary"]["header_boundary_y"]
             component_type = result["page_summary"]["component_type"]
