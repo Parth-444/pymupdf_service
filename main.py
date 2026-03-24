@@ -1021,3 +1021,11 @@ async def extract_spans_binary(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok", "pymupdf_version": pymupdf.__version__}
+
+@app.post("/extract-text")
+async def extract_text(file: UploadFile):
+    doc = pymupdf.open(stream=await file.read(), filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text("text") + "\n\n"
+    return {"text": text.strip()}
