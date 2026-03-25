@@ -618,6 +618,131 @@ def classify_page(spans: list) -> dict:
 # PDF PROCESSING
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# CHARACTER NORMALIZATION MAP
+# ─────────────────────────────────────────────────────────────
+# PDF fonts (especially Calibri in these artworks) use custom
+# glyph encodings that PyMuPDF extracts as unusual Unicode chars.
+# This map corrects known substitutions.
+# Add new mappings as you encounter them in other artworks.
+# ─────────────────────────────────────────────────────────────
+
+CHAR_NORMALIZE_MAP = {
+    "Ɵ": "t",
+    "ƫ": "t",
+    "ﬁ": "fi",
+    "ﬂ": "fl",
+    "ﬀ": "ff",
+    "ﬃ": "ffi",
+    "ﬄ": "ffl",
+    "ﬆ": "st",
+    "ﬅ": "st",
+    "\u00ad": "-",      # soft hyphen → regular hyphen
+    "\u2010": "-",      # hyphen
+    "\u2011": "-",      # non-breaking hyphen
+    "\u2012": "-",      # figure dash
+    "\u2013": "-",      # en dash
+    "\u2014": "-",      # em dash
+    "\u2018": "'",      # left single quote
+    "\u2019": "'",      # right single quote
+    "\u201c": '"',      # left double quote
+    "\u201d": '"',      # right double quote
+    "\u2026": "...",    # ellipsis
+    "\u00a0": " ",      # non-breaking space → regular space
+}
+
+
+def normalize_text(raw_text: str) -> str:
+    """Apply character normalization to fix font encoding artifacts.
+    
+    Replaces known problem characters and normalizes whitespace.
+    """
+    result = raw_text
+    for bad_char, good_char in CHAR_NORMALIZE_MAP.items():
+        result = result.replace(bad_char, good_char)
+    # Collapse multiple spaces into one
+    while "  " in result:
+        result = result.replace("  ", " ")
+    return result.strip()
+
+
+# ─────────────────────────────────────────────────────────────
+# LINE MERGING
+# ─────────────────────────────────────────────────────────────
+# PDFs store text as fragmented glyph spans. A single visible
+# word like "Injection" might be stored as ["Injec", "tion"].
+# 
+# PyMuPDF's get_text("dict") groups spans into lines, but each
+# line can still have multiple spans with different formatting.
+#
+# Strategy:
+#   1. For each line, merge consecutive spans that share the
+#      same formatting (font, size, bold, color) into one span.
+#   2. If formatting differs within a line, keep them separate
+#      but mark them as part of the same logical line.
+#   3. Apply character normalization to merged text.
+# ─────────────────────────────────────────────────────────────
+
+def merge_line_spans(line_spans: list) -> list:
+    """Merge consecutive spans in a line that share the same formatting.
+    
+    Input: list of raw span dicts from a single PyMuPDF line
+    Output: list of merged span dicts (fewer items, complete words)
+    
+    Two spans are merged if they have the same font, size, bold, and color.
+    The merged span gets:
+      - Concatenated text (with space if there's an x-gap > 1pt)
+      - Bounding box that encompasses both spans
+      - All other properties from the first span
+    """
+    if not line_spans:
+        return []
+
+    merged = []
+    current = None
+
+    for span in line_spans:
+        if current is None:
+            current = span.copy()
+            continue
+
+        # Check if this span can be merged with current
+        same_font = current["font"] == span["font"]
+        same_size = current["size"] == span["size"]
+        same_bold = current["bold"] == span["bold"]
+        same_color = current["color"] == span["color"]
+
+        if same_font and same_size and same_bold and same_color:
+            # Merge: check if we need a space between them
+            gap = span["x"] - (current["x"] + current["width"])
+            if gap > 1:  # more than 1pt gap → add space
+                current["text"] = current["text"] + " " + span["text"]
+            else:
+                current["text"] = current["text"] + span["text"]
+            # Expand bounding box
+            new_x = min(current["x"], span["x"])
+            new_right = max(current["x"] + current["width"], span["x"] + span["width"])
+            new_y = min(current["y"], span["y"])
+            new_bottom = max(current["y"] + current["height"], span["y"] + span["height"])
+            current["x"] = new_x
+            current["y"] = new_y
+            current["width"] = new_right - new_x
+            current["height"] = new_bottom - new_y
+        else:
+            # Different formatting → save current, start new
+            merged.append(current)
+            current = span.copy()
+
+    if current is not None:
+        merged.append(current)
+
+    return merged
+
+
+# ─────────────────────────────────────────────────────────────
+# UPDATED process_pdf
+# ─────────────────────────────────────────────────────────────
+
 def process_pdf(contents: bytes, filename: str) -> dict:
     tmp_path = os.path.join(tempfile.gettempdir(), f"upload_{filename}")
     try:
@@ -635,7 +760,7 @@ def process_pdf(contents: bytes, filename: str) -> dict:
             dict_data = page.get_text("dict", sort=True, flags=pymupdf.TEXTFLAGS_TEXT)
             dict_blocks = dict_data["blocks"]
 
-            # Build direction lookup for rotation detection
+            # ── Build direction lookup for rotation detection ──
             direction_lookup = {}
             for block in dict_blocks:
                 if "lines" not in block:
@@ -647,26 +772,29 @@ def process_pdf(contents: bytes, filename: str) -> dict:
                         key = (round(origin[0], 1), round(origin[1], 1))
                         direction_lookup[key] = line_dir
 
-            # ── Extract spans with SNAPPED values ──
+            # ── Extract spans LINE BY LINE, merge within each line ──
             spans_list = []
             for block in dict_blocks:
                 if "lines" not in block:
                     continue
                 for line in block["lines"]:
+                    # First pass: extract all raw spans from this line
+                    raw_line_spans = []
                     for span in line["spans"]:
-                        text = span["text"].strip()
-                        if not text:
+                        raw_text = span["text"].strip()
+                        if not raw_text:
                             continue
                         props = flags_to_properties(span["flags"])
                         bbox = span["bbox"]
 
+                        # Get rotation
                         origin = span.get("origin", (0, 0))
                         origin_key = (round(origin[0], 1), round(origin[1], 1))
                         direction = direction_lookup.get(origin_key, (1, 0))
                         rotation_angle = compute_rotation_angle(direction)
 
-                        spans_list.append({
-                            "text": text,
+                        raw_line_spans.append({
+                            "text": raw_text,
                             "font": span["font"],
                             "size": snap_size(span["size"]),
                             "color": color_to_hex(span["color"]),
@@ -682,6 +810,16 @@ def process_pdf(contents: bytes, filename: str) -> dict:
                             "rotation_deg": rotation_angle,
                         })
 
+                    # Second pass: merge spans within this line
+                    merged_spans = merge_line_spans(raw_line_spans)
+
+                    # Third pass: normalize text in merged spans
+                    for ms in merged_spans:
+                        ms["text"] = normalize_text(ms["text"])
+                        # Skip if text is empty after normalization
+                        if ms["text"]:
+                            spans_list.append(ms)
+
             # ── Classify spans ──
             result = classify_page(spans_list)
 
@@ -689,6 +827,10 @@ def process_pdf(contents: bytes, filename: str) -> dict:
             drawings = extract_drawings(page)
             images = extract_images(page, doc)
             rotated_spans = extract_rotations(dict_blocks)
+
+            # Normalize rotated span text too
+            for rs in rotated_spans:
+                rs["text"] = normalize_text(rs["text"])
 
             header_boundary = result["page_summary"]["header_boundary_y"]
             component_type = result["page_summary"]["component_type"]
@@ -741,7 +883,6 @@ def process_pdf(contents: bytes, filename: str) -> dict:
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-
 
 # ─────────────────────────────────────────────────────────────
 # API ENDPOINTS
